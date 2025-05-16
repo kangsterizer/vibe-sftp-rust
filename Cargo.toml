@@ -4,4 +4,6 @@
    edition = "2021"
 
    [dependencies]
-   ssh2 = "0.9" # Or the latest version
+   ssh2 = "0.9"
+   clap = { version = "4.4", features = ["derive"] }
+   rustyline = "13.0" # Or your chosen version
