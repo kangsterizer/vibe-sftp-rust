@@ -7,3 +7,8 @@
    ssh2 = "0.9"
    clap = { version = "4.4", features = ["derive"] }
    rustyline = "13.0" # Or your chosen version
+
+   [dev-dependencies]
+   mockall = "0.11.0"
+   # sftp-test-server = "0.2.2" # Removed as it was not found
+   tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
