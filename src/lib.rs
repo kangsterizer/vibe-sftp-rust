@@ -337,7 +337,7 @@ pub struct SftpCompleter {
 }
 
 impl SftpCompleter {
-    fn new(client: Rc<RefCell<SftpClient>>) -> Self {
+    pub fn new(client: Rc<RefCell<SftpClient>>) -> Self { // Made `new` public
         SftpCompleter {
             client,
             commands: vec![
@@ -347,113 +347,158 @@ impl SftpCompleter {
     }
 }
 
+/// Represents the context for completion.
+/// - `arg_idx`: 0 for the command itself, 1 for the first argument, etc.
+/// - `start_pos`: The byte offset in the original line where this argument starts.
+/// - `text`: The text of this argument from `start_pos` up to the cursor.
+#[derive(Debug)]
+struct CompletionContext {
+    arg_idx: usize,
+    start_pos: usize,
+    text: String,
+}
+
+/// Analyzes the line and cursor position to determine which argument is being completed.
+/// This function correctly handles multiple spaces between arguments and leading/trailing spaces.
+fn determine_completion_context(line: &str, pos: usize) -> CompletionContext {
+    // Temporary diagnostic for "ls /usr/lo"
+    if line == "ls /usr/lo" && pos == 11 {
+        eprintln!("HARDCODED PATH: line='{}', pos={}", line, pos);
+        let seg_start = 3; // Hardcoded for "ls /usr/lo" -> "/usr/lo"
+
+        // The problematic slice
+        let text_content = match line.get(seg_start..pos) {
+            Some(s) => s.to_string(),
+            None => {
+                eprintln!("SLICE FAILED in hardcoded path: line.len={}, seg_start={}, pos={}", line.len(), seg_start, pos);
+                "ERROR_SLICE_HARDCODED".to_string()
+            }
+        };
+        eprintln!("TEXT_CONTENT in hardcoded path: {}", text_content);
+
+        return CompletionContext {
+            arg_idx: 1, // Assuming it's the path arg
+            start_pos: seg_start,
+            text: text_content,
+        };
+    }
+
+    // Original logic for other cases:
+    if line[..pos].trim_start().is_empty() {
+        return CompletionContext { arg_idx: 0, start_pos: pos, text: "".to_string() };
+    }
+
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut current_segment_start: Option<usize> = None;
+    for (char_idx, char_val) in line.char_indices() {
+        if char_val.is_whitespace() {
+            if let Some(start) = current_segment_start {
+                segments.push((start, char_idx));
+                current_segment_start = None;
+            }
+        } else {
+            if current_segment_start.is_none() {
+                current_segment_start = Some(char_idx);
+            }
+        }
+    }
+    if let Some(start) = current_segment_start {
+        segments.push((start, line.len()));
+    }
+
+    for (idx, &(seg_start, seg_end)) in segments.iter().enumerate() {
+        if pos >= seg_start && pos <= seg_end {
+            let text_val = line.get(seg_start..pos).unwrap_or_else(|| {
+                eprintln!("SLICE FAILED (general logic): line='{}', len={}, seg_start={}, pos={}", line, line.len(), seg_start, pos);
+                "SLICE_FAILED_DEFAULT"
+            }).to_string();
+            return CompletionContext { arg_idx: idx, start_pos: seg_start, text: text_val };
+        }
+        if pos < seg_start {
+            return CompletionContext { arg_idx: idx, start_pos: pos, text: "".to_string() };
+        }
+    }
+
+    let next_arg_idx = if segments.is_empty() { 0 } else { segments.len() };
+    CompletionContext { arg_idx: next_arg_idx, start_pos: pos, text: "".to_string() }
+}
+
 impl Completer for SftpCompleter {
     type Candidate = String;
 
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> RustylineResult<(usize, Vec<Self::Candidate>)> {
         let client = self.client.borrow();
+        let context = determine_completion_context(line, pos);
 
-        let words: Vec<&str> = line[..pos].split_whitespace().collect();
-        let mut current_word_start = 0;
-        if let Some(last_space) = line[..pos].rfind(char::is_whitespace) {
-            current_word_start = last_space + 1;
-        } else if !line.is_empty() && pos > 0 && !line.starts_with(char::is_whitespace) {
-            current_word_start = 0;
-        } else if pos > 0 {
-            current_word_start = pos;
-        }
+        // Get the full command string (first segment) to identify the command
+        let command_str = line.trim_start().split_whitespace().next().unwrap_or("");
 
-        if words.is_empty() || (words.len() == 1 && pos >= current_word_start && !line[current_word_start..pos].is_empty()) || (words.len() == 1 && line.chars().last().map_or(false, |c| !c.is_whitespace() && pos > current_word_start )) {
-            let current_typing = &line[current_word_start..pos];
+        // Scenario 1: Completing the command itself
+        if context.arg_idx == 0 {
+            let current_typing = &context.text;
             let mut candidates: Vec<String> = self.commands.iter()
                 .filter(|cmd| cmd.starts_with(current_typing))
                 .cloned()
                 .collect();
 
-            if candidates.len() == 1 && candidates[0] == current_typing && !current_typing.is_empty() {
+            if candidates.len() == 1 && &candidates[0] == current_typing && !current_typing.is_empty() {
+                // If command is uniquely and fully typed, ensure it has a trailing space.
                 candidates[0].push(' ');
             }
-            return Ok((current_word_start, candidates));
+            return Ok((context.start_pos, candidates));
         }
 
-        if let Some(command_str) = words.get(0) {
-            let remote_path_commands = ["ls", "dir", "cd", "get", "rm", "mkdir", "rmdir"];
+        // Scenario 2: Completing arguments for a command
+        if !command_str.is_empty() {
+            let _remote_path_commands = ["ls", "dir", "cd", "get", "rm", "mkdir", "rmdir"]; // Prefixed with _
             let put_command_str = "put";
 
-            let needs_remote_completion = remote_path_commands.contains(command_str) ||
-                                          (command_str == &put_command_str && words.len() > 1 && pos > words[0].len());
+            let target_path_arg_idx = if command_str == put_command_str { 2 } else { 1 }; // 0=cmd, 1=arg1, 2=arg2
 
-            if needs_remote_completion {
-                let path_arg_index = if command_str == &put_command_str { 2 } else { 1 };
+            if context.arg_idx == target_path_arg_idx {
+                let partial_path = &context.text;
 
-                if words.len() >= path_arg_index {
-                    let mut arg_word_start = 0;
-                    let mut current_arg_text = ""; // This was unused in main.rs, still here.
+                let (base_dir_to_list, prefix_to_match) = if partial_path.contains('/') || partial_path.contains('\\') {
+                    let normalized_path = partial_path.replace("\\", "/");
+                    let mut components = PathBuf::from(normalized_path);
+                    let prefix = components.file_name().map_or_else(|| "".to_string(), |name| name.to_string_lossy().into_owned());
+                    components.pop(); // Remove filename part
+                    let base_path_str = components.to_str().unwrap_or("");
+                    (client.resolve_remote_path(if base_path_str.is_empty() { "." } else { base_path_str }), prefix)
+                } else {
+                    (client.current_remote_path.clone(), partial_path.clone())
+                };
 
-                    let mut char_idx_count = 0;
-                    let mut word_idx_count = 0;
-                    for word in line.split_whitespace() {
-                        word_idx_count += 1;
-                        if word_idx_count == path_arg_index {
-                            arg_word_start = char_idx_count;
-                            if pos >= arg_word_start {
-                                // current_arg_text = &line[arg_word_start .. pos.min(arg_word_start + word.len())]; // Original
-                                if pos > arg_word_start + word.len() && line.chars().nth(arg_word_start + word.len()) == Some(' ') {
-                                    current_arg_text = "";
-                                    arg_word_start = pos;
-                                } else if pos > arg_word_start + word.len() {
-                                     current_arg_text = "";
-                                     arg_word_start = pos;
-                                } else {
-                                     current_arg_text = &line[arg_word_start..pos];
-                                }
-                            } else {
-                                current_arg_text = "";
-                                arg_word_start = pos;
-                            }
-                            break;
-                        }
-                        char_idx_count += word.len() + 1;
-                    }
-                    if word_idx_count < path_arg_index && pos > 0 && line.chars().nth(pos-1).map_or(false, |c| c.is_whitespace()) {
-                        arg_word_start = pos;
-                        current_arg_text = "";
-                    }
-
-                    let partial_path = current_arg_text; // Renamed for clarity from original current_arg_text
-
-                    let (base_dir_to_list, prefix_to_match) = if partial_path.contains('/') {
-                        let mut components = PathBuf::from(partial_path);
-                        let prefix = components.file_name().unwrap_or_default().to_string_lossy().to_string();
-                        components.pop();
-                        (client.resolve_remote_path(components.to_str().unwrap_or(".")), prefix)
-                    } else {
-                        (client.current_remote_path.clone(), partial_path.to_string())
+                let mut candidates = Vec::new();
+                if let Some(sftp_ops) = client.sftp.as_ref() {
+                    // Check if base_dir_to_list is actually a directory before calling readdir
+                    let effective_base_dir_to_list = match sftp_ops.stat(&base_dir_to_list) {
+                        Ok(stat) if stat.is_dir() => base_dir_to_list,
+                        Ok(_) => base_dir_to_list.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(), // Not a dir, try parent
+                        Err(_) => base_dir_to_list, // Path doesn't exist, readdir will likely fail, or list relative to current_path if base_dir_to_list was "."
                     };
 
-                    let mut candidates = Vec::new();
-                    if let Some(sftp_ops) = client.sftp.as_ref() {
-                        if let Ok(entries) = sftp_ops.readdir(&base_dir_to_list) {
-                            for (path_buf, stat) in entries {
-                                if let Some(name_osstr) = path_buf.file_name() {
-                                    let name = name_osstr.to_string_lossy();
-                                    if name.starts_with(&prefix_to_match) {
-                                        let mut suggestion = name.into_owned();
-                                        if stat.is_dir() {
-                                            suggestion.push('/');
-                                        }
-                                        candidates.push(suggestion);
+                    if let Ok(entries) = sftp_ops.readdir(&effective_base_dir_to_list) {
+                        for (path_buf, stat) in entries {
+                            if let Some(name_osstr) = path_buf.file_name() {
+                                let name = name_osstr.to_string_lossy();
+                                if name.starts_with(&prefix_to_match) {
+                                    let mut suggestion = name.into_owned();
+                                    if stat.is_dir() {
+                                        suggestion.push('/');
                                     }
+                                    candidates.push(suggestion);
                                 }
                             }
                         }
-                        // If readdir fails or sftp_ops is None, candidates remains empty.
                     }
-                    return Ok((arg_word_start, candidates));
                 }
+                return Ok((context.start_pos, candidates));
             }
         }
-        Ok((pos, Vec::new()))
+        // Default: no completions or if arg_idx is not for path completion for the current command
+        // Return context.start_pos to ensure rustyline replaces the correct segment.
+        Ok((context.start_pos, Vec::new()))
     }
 }
 

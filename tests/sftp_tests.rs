@@ -409,3 +409,320 @@ mod sftp_client_unit_tests {
         assert_eq!(client.current_remote_path, initial_dir); // Path should not change
     }
 }
+
+#[cfg(test)]
+mod sftp_completer_tests {
+    use super::*; // For MockSftpOps, SftpClient, FileStat, SshError etc.
+    use rust_sftp_client::SftpCompleter; // The struct we're testing
+    use rustyline::completion::Completer as RustylineCompleter; // Alias to avoid conflict
+    use rustyline::Context;
+    use rustyline::history::DefaultHistory; // Import DefaultHistory
+    use std::rc::Rc;
+    use std::cell::RefCell;
+
+    // Helper to create a FileStat for a directory
+    fn dir_stat() -> FileStat {
+        FileStat { perm: Some(0o040755), size: Some(4096), uid: Some(1000), gid: Some(1000), atime: Some(0), mtime: Some(0) }
+    }
+
+    // Helper to create a FileStat for a file
+    fn file_stat() -> FileStat {
+        FileStat { perm: Some(0o100644), size: Some(1024), uid: Some(1000), gid: Some(1000), atime: Some(0), mtime: Some(0) }
+    }
+
+    // Simpler setup: creates client and completer, assumes mock expectations are set beforehand.
+    fn create_completer(mock_sftp: MockSftpOps, current_remote_path_str: &str) -> (SftpCompleter, Rc<RefCell<SftpClient>>) {
+        let current_remote_path = PathBuf::from(current_remote_path_str);
+        let sftp_client = SftpClient::new_for_test(
+            Box::new(mock_sftp),
+            current_remote_path,
+            "mockhost".to_string()
+        );
+        let client_rc = Rc::new(RefCell::new(sftp_client));
+        let completer = SftpCompleter::new(client_rc.clone());
+        (completer, client_rc)
+    }
+
+
+    fn assert_completions(
+        completer: &SftpCompleter,
+        line: &str,
+        pos: usize,
+        expected_start: usize,
+        expected_candidates: &[&str],
+    ) {
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        let (start, candidates) = completer.complete(line, pos, &ctx).unwrap();
+        assert_eq!(start, expected_start, "Completion start position mismatch for line: '{}', pos: {}", line, pos);
+
+        let mut sorted_candidates: Vec<String> = candidates.into_iter().collect();
+        sorted_candidates.sort();
+        let mut sorted_expected: Vec<String> = expected_candidates.iter().map(|s| s.to_string()).collect();
+        sorted_expected.sort();
+
+        assert_eq!(sorted_candidates, sorted_expected, "Candidate list mismatch for line: '{}', pos: {}", line, pos);
+    }
+
+    #[test]
+    fn complete_command_empty_input() {
+        let mock = MockSftpOps::new(); // No SFTP calls expected
+        let (completer, _client) = create_completer(mock, "/");
+        // Let's list them explicitly as per SftpCompleter::new
+        let expected = ["ls", "dir", "get", "put", "cd", "pwd", "rm", "mkdir", "rmdir", "help", "?", "exit", "quit", "bye"];
+        assert_completions(&completer, "", 0, 0, &expected);
+    }
+
+    #[test]
+    fn complete_command_partial() {
+        let mock = MockSftpOps::new();
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "l", 1, 0, &["ls"]);
+        assert_completions(&completer, "ge", 2, 0, &["get"]);
+         assert_completions(&completer, "ex", 2, 0, &["exit"]);
+    }
+
+    #[test]
+    fn complete_command_full_match_with_space() {
+        let mock = MockSftpOps::new();
+        let (completer, _client) = create_completer(mock, "/");
+        // If "ls" is typed, it should suggest "ls " to allow starting path completion.
+        assert_completions(&completer, "ls", 2, 0, &["ls "]);
+        assert_completions(&completer, "cd", 2, 0, &["cd "]);
+        // If space is already there
+        assert_completions(&completer, "ls ", 3, 3, &[]); // No command completion, should be path completion
+    }
+
+    #[test]
+    fn complete_path_ls_partial() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat() // stat for /
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("partial_match_file"), file_stat()),
+                (PathBuf::from("partial_other_dir"), dir_stat()),
+                (PathBuf::from("another_file"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "ls partial_", 11, 3, &[
+            "partial_match_file",
+            "partial_other_dir/"
+        ]);
+    }
+
+    #[test]
+    fn complete_path_cd_full_dir_name() {
+        let mut mock = MockSftpOps::new();
+         mock.expect_stat() // stat for /
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("existing_dir"), dir_stat()),
+                (PathBuf::from("other_file"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        // When "cd existing_dir" is typed, and it's a unique match for a dir,
+        // rustyline might call complete again AFTER inserting "existing_dir/".
+        // Here, we test the state "cd existing_dir" (pos at end of existing_dir)
+        // It should offer "existing_dir/" if "existing_dir" is a known entry.
+        assert_completions(&completer, "cd existing_dir", 15, 3, &["existing_dir/"]);
+    }
+
+    #[test]
+    fn complete_path_get_with_spaces() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat() // stat for /
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("file with spaces.txt"), file_stat()),
+                (PathBuf::from("another file"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "get file with spa", 18, 4, &["file with spaces.txt"]);
+    }
+
+    #[test]
+    fn complete_path_cursor_not_at_end() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat())); // Allow any stat for simplicity
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("file_alpha"), file_stat()),
+                (PathBuf::from("file_beta"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        // Line: "ls file_alp remote_stuff_after"
+        // Pos: cursor after "file_alp" (position 12)
+        assert_completions(&completer, "ls file_alp remote_stuff_after", 12, 3, &["file_alpha"]);
+    }
+
+    #[test]
+    fn complete_path_empty_remote_dir() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(Vec::new())); // Empty directory
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "ls ", 3, 3, &[]);
+    }
+
+    #[test]
+    fn complete_path_readdir_fails() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Err(SshError::new(ErrorCode::SFTP(4), "Permission denied")));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "ls ", 3, 3, &[]);
+    }
+
+    #[test]
+    fn complete_path_absolute_path() {
+        let mut mock = MockSftpOps::new();
+        // Stat for the base path being listed
+        mock.expect_stat()
+            .with(eq(Path::new("/usr/"))) // Base dir derived from "/usr/lo"
+            .returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/usr/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("local"), dir_stat()),
+                (PathBuf::from("lib"), dir_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/home/user"); // Current dir doesn't matter for absolute
+        assert_completions(&completer, "ls /usr/lo", 11, 3, &["local/"]);
+    }
+
+    #[test]
+    fn complete_path_with_dot_dot() {
+        let mut mock = MockSftpOps::new();
+        // Stat for the resolved path "../d" from "/a/b/c" -> "/a/b/d"
+        let base_dir = PathBuf::from("/a/b"); // client.resolve_remote_path("../") from /a/b/c
+        mock.expect_stat()
+             .with(eq(base_dir.clone())) // for base_dir_to_list
+             .returning(move |_| Ok(dir_stat()));
+
+        mock.expect_readdir()
+            .with(eq(base_dir.clone())) // for readdir itself
+            .returning(|_| Ok(vec![
+                (PathBuf::from("dir1"), dir_stat()),
+                (PathBuf::from("dir2_other"), dir_stat()),
+                (PathBuf::from("file_in_b"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/a/b/c");
+        assert_completions(&completer, "ls ../dir", 10, 3, &["dir1/", "dir2_other/"]);
+    }
+
+    #[test]
+    fn complete_put_command_second_arg() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat())); // For current dir "/"
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("remote_place"), dir_stat()),
+                (PathBuf::from("remote_file.txt"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "put localfile.txt remote_", 25, 18, &[
+            "remote_place/",
+            "remote_file.txt"
+        ]);
+    }
+
+    #[test]
+    fn complete_put_command_after_first_arg_space() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("remote_A"), dir_stat()),
+                (PathBuf::from("remote_B"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        // Cursor is at "put localfile.txt |" (pos 18)
+        assert_completions(&completer, "put localfile.txt ", 18, 18, &[
+            "remote_A/",
+            "remote_B"
+        ]);
+    }
+
+    #[test]
+    fn no_remote_completion_for_put_first_arg() {
+        let mock = MockSftpOps::new(); // No SFTP calls should be made
+        // Expectations for readdir or stat would fail if called.
+
+        let (completer, _client) = create_completer(mock, "/");
+        // Trying to complete first arg of put "put loca|"
+        assert_completions(&completer, "put loca", 8, 4, &[]); // No remote completions
+    }
+
+    #[test]
+    fn complete_path_multiple_spaces_between_args() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![(PathBuf::from("spaced_out_file"), file_stat())]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "ls    spaced_out", 17, 6, &["spaced_out_file"]);
+    }
+
+    #[test]
+    fn complete_path_leading_spaces_before_command() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![(PathBuf::from("lead_file"), file_stat())]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "  ls lead_", 11, 5, &["lead_file"]);
+    }
+     #[test]
+    fn complete_path_trailing_spaces_after_partial_arg() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("trail_file"), file_stat()),
+                (PathBuf::from("trail_dir"), dir_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        // This case means "ls trail |" (cursor after space)
+        // The `determine_completion_context` should identify this as completing a *new, empty* argument.
+        // However, if the intent is to complete "trail" itself, the cursor should be `ls trail|`
+        // If line is "ls trail  " and pos is 10 (after spaces), it means we are starting a new (3rd) argument.
+        // The current completer logic, if `determine_completion_context` sets `text=""` and `start_pos=pos`,
+        // would try to list entries in "/" matching an empty prefix.
+        assert_completions(&completer, "ls trail  ", 10, 10, &[
+            "trail_file",
+            "trail_dir/"
+        ]);
+    }
+}
