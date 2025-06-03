@@ -220,14 +220,14 @@ impl SftpClient {
     // For simplicity, making it a regular public method for now.
     pub fn new_for_test(
         mock_sftp: Box<dyn SftpOperations>,
-        current_remote_path: PathBuf, // Renamed current_path to current_remote_path for clarity
+        current_remote_path: PathBuf, // Renamed current_path to current_remote_path
         current_local_path: PathBuf,  // Added new parameter
         host_string: String
     ) -> Self {
         SftpClient {
             session: None,
             sftp: Some(mock_sftp),
-            current_remote_path, // Renamed field usage
+            current_remote_path,
             current_local_path,  // Added field usage
             connected_host_string: host_string,
         }
@@ -362,12 +362,11 @@ impl SftpClient {
                                 Ok(ft) if ft.is_file() => "f",
                                 Ok(ft) if ft.is_symlink() => "l",
                                 Ok(_) => "?",
-                                Err(_) => "?", // Could not get file type
+                                Err(_) => "?",
                             };
                             println!("{} {}", file_type_char, file_name);
                         }
                         Err(e) => {
-                            // Print error for specific entry and continue
                             eprintln!("Error reading entry in {}: {}", target_path.display(), e);
                         }
                     }
@@ -380,6 +379,36 @@ impl SftpClient {
             Err(e) => {
                 Err(format!("Could not read directory {}: {}", target_path.display(), e).into())
             }
+        }
+    }
+
+    pub fn lcd(&mut self, local_path_str: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if local_path_str.is_empty() {
+            return Err("Local path cannot be empty for lcd command.".into());
+        }
+        let initial_path = PathBuf::from(local_path_str);
+        let new_path_candidate = if initial_path.is_absolute() {
+            initial_path
+        } else {
+            self.current_local_path.join(initial_path)
+        };
+
+        match std::fs::canonicalize(&new_path_candidate) {
+            Ok(canonical_path) => {
+                match std::fs::metadata(&canonical_path) {
+                    Ok(metadata) => {
+                        if metadata.is_dir() {
+                            self.current_local_path = canonical_path;
+                            println!("Local directory now: {}", self.current_local_path.display());
+                            Ok(())
+                        } else {
+                            Err(format!("Not a directory: {}", new_path_candidate.display()).into())
+                        }
+                    }
+                    Err(e) => Err(format!("Could not get metadata for {}: {}", new_path_candidate.display(), e).into()),
+                }
+            }
+            Err(e) => Err(format!("Invalid local path {}: {}", new_path_candidate.display(), e).into()),
         }
     }
 }
@@ -396,7 +425,7 @@ impl SftpCompleter {
             client,
             commands: vec![
                 "ls", "dir", "get", "put", "cd", "pwd", "rm", "mkdir", "rmdir",
-                "lls", "help", "?", "exit", "quit", "bye", // Added "lls"
+                "lls", "lcd", "help", "?", "exit", "quit", "bye", // Added "lls", "lcd"
             ].into_iter().map(String::from).collect(),
         }
     }
@@ -441,8 +470,9 @@ impl Helper for SftpCompleter {}
 pub fn print_help() {
     println!("Available commands:");
     println!("  ls [path]            List remote directory contents");
-    println!("  lls [path]           List local directory contents"); // Added lls help
+    println!("  lls [path]           List local directory contents");
     println!("  cd <path>            Change remote working directory");
+    println!("  lcd <path>           Change local working directory");
     println!("  pwd                  Print remote working directory");
     println!("  get <remote> [local] Download file from remote to local");
     println!("  put <local> [remote] Upload file from local to remote");
@@ -460,7 +490,11 @@ pub fn process_command(client_rc: &Rc<RefCell<SftpClient>>, command_parts: &[Str
 
     match command.as_str() {
         "ls" | "dir" => client_rc.borrow().list_dir(args.get(0).map(String::as_str))?,
-        "lls" => client_rc.borrow().lls(args.get(0).map(String::as_str))?, // Added lls command
+        "lls" => client_rc.borrow().lls(args.get(0).map(String::as_str))?,
+        "lcd" => {
+            if args.is_empty() { return Err("lcd: missing <local_path>".into()); }
+            client_rc.borrow_mut().lcd(&args[0])?;
+        }
         "get" => {
             if args.is_empty() { return Err("get: missing <remote_file>".into()); }
             client_rc.borrow().download_file(&args[0], args.get(1).map(String::as_str))?;
@@ -504,8 +538,16 @@ pub fn interactive_shell(client_rc: Rc<RefCell<SftpClient>>) -> Result<(), Box<d
     loop {
         let prompt = {
             let client_borrow = client_rc.borrow();
-            let current_dir_name = client_borrow.current_remote_path.file_name().unwrap_or_default().to_string_lossy();
-            format!("sftp:{}> ", if current_dir_name.is_empty() { "/" } else { &current_dir_name } )
+            let local_path = &client_borrow.current_local_path;
+            let path_file_name = local_path.file_name().unwrap_or_default().to_string_lossy();
+
+            let display_path_name = if path_file_name.is_empty() || local_path.parent().is_none() {
+                // If file_name is empty (e.g. for "." or ".."), or if it's a root path
+                local_path.to_string_lossy()
+            } else {
+                path_file_name
+            };
+            format!("sftp:{}> ", display_path_name)
         };
 
         match rl.readline(&prompt) {

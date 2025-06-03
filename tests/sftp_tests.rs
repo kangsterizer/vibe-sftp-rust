@@ -440,10 +440,10 @@ mod sftp_completer_tests {
     // Simpler setup: creates client and completer, assumes mock expectations are set beforehand.
     fn create_completer(mock_sftp: MockSftpOps, current_remote_path_str: &str) -> (SftpCompleter, Rc<RefCell<SftpClient>>) {
         let current_remote_path = PathBuf::from(current_remote_path_str);
-        let sftp_client = SftpClient::new_for_test( // This is the call to update
+        let sftp_client = SftpClient::new_for_test(
             Box::new(mock_sftp),
             current_remote_path,
-            PathBuf::from("."), // Default local path for completer tests
+            PathBuf::from("."), // Added current_local_path for tests
             "mockhost".to_string()
         );
         let client_rc = Rc::new(RefCell::new(sftp_client));
