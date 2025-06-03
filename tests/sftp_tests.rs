@@ -240,6 +240,7 @@ mod sftp_client_unit_tests {
         let client = SftpClient::new_for_test(
             Box::new(mock_sftp),
             current_dir.clone(),
+            PathBuf::from("."), // Added current_local_path
             "mockhost".to_string()
         );
 
@@ -281,6 +282,7 @@ mod sftp_client_unit_tests {
         let client = SftpClient::new_for_test(
             Box::new(mock_sftp),
             current_dir.clone(),
+            PathBuf::from("."), // Added current_local_path
             "mockhost".to_string()
         );
         assert!(client.list_dir(None).is_ok());
@@ -299,6 +301,7 @@ mod sftp_client_unit_tests {
         let client = SftpClient::new_for_test(
             Box::new(mock_sftp),
             current_dir.clone(),
+            PathBuf::from("."), // Added current_local_path
             "mockhost".to_string()
         );
 
@@ -318,6 +321,7 @@ mod sftp_client_unit_tests {
         let client = SftpClient::new_for_test(
             Box::new(mock_sftp),
             current_dir.clone(),
+            PathBuf::from("."), // Added current_local_path
             "mockhost".to_string()
         );
 
@@ -349,6 +353,7 @@ mod sftp_client_unit_tests {
         let mut client = SftpClient::new_for_test(
             Box::new(mock_sftp),
             initial_dir.clone(),
+            PathBuf::from("."), // Added current_local_path
             "mockhost".to_string()
         );
 
@@ -374,6 +379,7 @@ mod sftp_client_unit_tests {
         let mut client = SftpClient::new_for_test(
             Box::new(mock_sftp),
             initial_dir.clone(),
+            PathBuf::from("."), // Added current_local_path
             "mockhost".to_string()
         );
         assert!(client.cd_remote(target_dir_str).is_err());
@@ -403,9 +409,196 @@ mod sftp_client_unit_tests {
         let mut client = SftpClient::new_for_test(
             Box::new(mock_sftp),
             initial_dir.clone(),
+            PathBuf::from("."), // Added current_local_path
             "mockhost".to_string()
         );
         assert!(client.cd_remote(target_file_str).is_err());
         assert_eq!(client.current_remote_path, initial_dir); // Path should not change
+    }
+}
+
+#[cfg(test)]
+mod local_command_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir; // Changed from TempDir to tempdir for function usage
+
+    // Helper function to create an SftpClient for local tests
+    fn create_test_client(initial_local_path: PathBuf) -> SftpClient {
+        let mock_sftp = MockSftpOps::new(); // No remote operations expected for lls/lcd
+        SftpClient::new_for_test(
+            Box::new(mock_sftp),
+            PathBuf::from("/mock/remote"), // Mock remote path, not used by lls/lcd
+            initial_local_path,
+            "localtest_mockhost".to_string(),
+        )
+    }
+
+    #[test]
+    fn test_lcd_to_subdir_relative() {
+        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
+        let subdir = base_temp_dir.path().join("subdir1");
+        fs::create_dir(&subdir).expect("Failed to create subdir");
+
+        let mut client = create_test_client(base_temp_dir.path().to_path_buf());
+
+        let result = client.lcd("subdir1");
+        assert!(result.is_ok(), "lcd to subdir1 failed: {:?}", result.err());
+
+        let expected_path = fs::canonicalize(&subdir).expect("Failed to canonicalize subdir");
+        assert_eq!(client.current_local_path, expected_path);
+    }
+
+    #[test]
+    fn test_lcd_to_subdir_absolute() {
+        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
+        let subdir = base_temp_dir.path().join("subdir_abs");
+        fs::create_dir(&subdir).expect("Failed to create subdir_abs");
+        let subdir_abs_path_str = subdir.to_str().unwrap();
+
+        // Start client in a different directory to ensure absolute path works
+        let other_temp_dir = tempdir().expect("Failed to create other temp dir");
+        let mut client = create_test_client(other_temp_dir.path().to_path_buf());
+
+        let result = client.lcd(subdir_abs_path_str);
+        assert!(result.is_ok(), "lcd to absolute path failed: {:?}", result.err());
+
+        let expected_path = fs::canonicalize(&subdir).expect("Failed to canonicalize subdir_abs");
+        assert_eq!(client.current_local_path, expected_path);
+    }
+
+    #[test]
+    fn test_lcd_to_parent_dir() {
+        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
+        let subdir = base_temp_dir.path().join("subdir_for_parent_test");
+        fs::create_dir(&subdir).expect("Failed to create subdir_for_parent_test");
+
+        let mut client = create_test_client(subdir.clone()); // Start in subdir
+
+        let result = client.lcd("..");
+        assert!(result.is_ok(), "lcd to parent failed: {:?}", result.err());
+
+        let expected_path = fs::canonicalize(base_temp_dir.path()).expect("Failed to canonicalize base_temp_dir");
+        assert_eq!(client.current_local_path, expected_path);
+    }
+
+    #[test]
+    fn test_lcd_non_existent_path() {
+        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
+        let initial_path = base_temp_dir.path().to_path_buf();
+        let mut client = create_test_client(initial_path.clone());
+
+        let result = client.lcd("non_existent_dir");
+        assert!(result.is_err(), "lcd to non_existent_dir should fail");
+        assert_eq!(client.current_local_path, initial_path); // Path should not change
+    }
+
+    #[test]
+    fn test_lcd_to_file() {
+        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
+        let file_path = base_temp_dir.path().join("file.txt");
+        fs::File::create(&file_path).expect("Failed to create file.txt");
+
+        let initial_path = base_temp_dir.path().to_path_buf();
+        let mut client = create_test_client(initial_path.clone());
+
+        let result = client.lcd("file.txt");
+        assert!(result.is_err(), "lcd to a file should fail");
+        let err_msg = result.err().unwrap().to_string();
+        assert!(err_msg.contains("Not a directory"), "Error message mismatch: {}", err_msg);
+        assert_eq!(client.current_local_path, initial_path); // Path should not change
+    }
+
+    #[test]
+    fn test_lcd_empty_path() {
+        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
+        let initial_path = base_temp_dir.path().to_path_buf();
+        let mut client = create_test_client(initial_path.clone());
+
+        let result = client.lcd(""); // Behavior might depend on std::fs::canonicalize("")
+                                      // Typically canonicalize("") fails or refers to current dir.
+                                      // Our lcd should probably error if path is empty before canonicalize.
+                                      // Based on current lcd impl, canonicalize will fail.
+        assert!(result.is_err(), "lcd with empty path should fail");
+        assert_eq!(client.current_local_path, initial_path); // Path should not change
+    }
+
+
+    // --- lls Tests ---
+    #[test]
+    fn test_lls_current_dir_with_content() {
+        let temp_dir = tempdir().expect("Failed to create temp_dir for lls");
+        fs::File::create(temp_dir.path().join("file_a.txt")).unwrap();
+        fs::File::create(temp_dir.path().join("file_b.txt")).unwrap();
+        fs::create_dir(temp_dir.path().join("sub_dir_c")).unwrap();
+
+        let client = create_test_client(temp_dir.path().to_path_buf());
+        // As per subtask, if output capture is hard, just test Ok/Err
+        // This test assumes lls prints to stdout. We check if it runs without error.
+        let result = client.lls(None);
+        assert!(result.is_ok(), "lls failed for current directory: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_lls_relative_path_subdir() {
+        let base_dir = tempdir().expect("Failed to create base_dir for lls relative");
+        let sub_dir = base_dir.path().join("my_subdir");
+        fs::create_dir(&sub_dir).unwrap();
+        fs::File::create(sub_dir.join("file_in_sub.txt")).unwrap();
+
+        let client = create_test_client(base_dir.path().to_path_buf());
+        let result = client.lls(Some("my_subdir"));
+        assert!(result.is_ok(), "lls failed for relative subdir: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_lls_absolute_path_subdir() {
+        let base_dir = tempdir().expect("Failed to create base_dir for lls absolute");
+        let sub_dir = base_dir.path().join("another_subdir");
+        fs::create_dir(&sub_dir).unwrap();
+        fs::File::create(sub_dir.join("abs_file.txt")).unwrap();
+        let sub_dir_abs_path_str = sub_dir.to_str().unwrap();
+
+        // Start client in a different directory
+        let other_dir = tempdir().expect("Failed to create other_dir for lls absolute");
+        let client = create_test_client(other_dir.path().to_path_buf());
+
+        let result = client.lls(Some(sub_dir_abs_path_str));
+        assert!(result.is_ok(), "lls failed for absolute subdir path: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_lls_empty_directory() {
+        let temp_dir = tempdir().expect("Failed to create empty_dir for lls");
+        let client = create_test_client(temp_dir.path().to_path_buf());
+        let result = client.lls(None);
+        assert!(result.is_ok(), "lls failed for empty directory: {:?}", result.err());
+        // If we could capture output, we'd check for "(empty directory)"
+    }
+
+    #[test]
+    fn test_lls_non_existent_path() {
+        let temp_dir = tempdir().expect("Failed to create temp_dir for lls non-existent");
+        let client = create_test_client(temp_dir.path().to_path_buf());
+        let result = client.lls(Some("no_such_dir_here"));
+        assert!(result.is_err(), "lls should fail for non-existent path");
+    }
+
+    #[test]
+    fn test_lls_on_file_path() {
+        let temp_dir = tempdir().expect("Failed to create temp_dir for lls on file");
+        let file_path = temp_dir.path().join("i_am_a_file.txt");
+        fs::File::create(&file_path).unwrap();
+
+        let client = create_test_client(temp_dir.path().to_path_buf());
+        let result = client.lls(Some("i_am_a_file.txt"));
+        assert!(result.is_err(), "lls should fail when path is a file");
+         let err_msg = result.err().unwrap().to_string();
+        // The error comes from std::fs::read_dir, which varies by OS,
+        // but it should indicate it's not a directory or similar.
+        // For example, on Linux: "Not a directory (os error 20)"
+        // On Windows: "The directory name is invalid. (os error 267)"
+        // For now, checking it's an error is sufficient given the constraints.
+        assert!(err_msg.contains("Could not read directory"), "Error message mismatch: {}", err_msg);
     }
 }
