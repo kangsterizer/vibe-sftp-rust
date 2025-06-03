@@ -418,187 +418,319 @@ mod sftp_client_unit_tests {
 }
 
 #[cfg(test)]
-mod local_command_tests {
-    use super::*;
-    use std::fs;
-    use tempfile::tempdir; // Changed from TempDir to tempdir for function usage
+mod sftp_completer_tests {
+    use super::*; // For MockSftpOps, SftpClient, FileStat, SshError etc.
+    use rust_sftp_client::SftpCompleter; // The struct we're testing
+    use rustyline::completion::Completer as RustylineCompleter; // Alias to avoid conflict
+    use rustyline::Context;
+    use rustyline::history::DefaultHistory; // Import DefaultHistory
+    use std::rc::Rc;
+    use std::cell::RefCell;
 
-    // Helper function to create an SftpClient for local tests
-    fn create_test_client(initial_local_path: PathBuf) -> SftpClient {
-        let mock_sftp = MockSftpOps::new(); // No remote operations expected for lls/lcd
-        SftpClient::new_for_test(
+    // Helper to create a FileStat for a directory
+    fn dir_stat() -> FileStat {
+        FileStat { perm: Some(0o040755), size: Some(4096), uid: Some(1000), gid: Some(1000), atime: Some(0), mtime: Some(0) }
+    }
+
+    // Helper to create a FileStat for a file
+    fn file_stat() -> FileStat {
+        FileStat { perm: Some(0o100644), size: Some(1024), uid: Some(1000), gid: Some(1000), atime: Some(0), mtime: Some(0) }
+    }
+
+    // Simpler setup: creates client and completer, assumes mock expectations are set beforehand.
+    fn create_completer(mock_sftp: MockSftpOps, current_remote_path_str: &str) -> (SftpCompleter, Rc<RefCell<SftpClient>>) {
+        let current_remote_path = PathBuf::from(current_remote_path_str);
+        let sftp_client = SftpClient::new_for_test( // This is the call to update
             Box::new(mock_sftp),
-            PathBuf::from("/mock/remote"), // Mock remote path, not used by lls/lcd
-            initial_local_path,
-            "localtest_mockhost".to_string(),
-        )
-    }
-
-    #[test]
-    fn test_lcd_to_subdir_relative() {
-        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
-        let subdir = base_temp_dir.path().join("subdir1");
-        fs::create_dir(&subdir).expect("Failed to create subdir");
-
-        let mut client = create_test_client(base_temp_dir.path().to_path_buf());
-
-        let result = client.lcd("subdir1");
-        assert!(result.is_ok(), "lcd to subdir1 failed: {:?}", result.err());
-
-        let expected_path = fs::canonicalize(&subdir).expect("Failed to canonicalize subdir");
-        assert_eq!(client.current_local_path, expected_path);
-    }
-
-    #[test]
-    fn test_lcd_to_subdir_absolute() {
-        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
-        let subdir = base_temp_dir.path().join("subdir_abs");
-        fs::create_dir(&subdir).expect("Failed to create subdir_abs");
-        let subdir_abs_path_str = subdir.to_str().unwrap();
-
-        // Start client in a different directory to ensure absolute path works
-        let other_temp_dir = tempdir().expect("Failed to create other temp dir");
-        let mut client = create_test_client(other_temp_dir.path().to_path_buf());
-
-        let result = client.lcd(subdir_abs_path_str);
-        assert!(result.is_ok(), "lcd to absolute path failed: {:?}", result.err());
-
-        let expected_path = fs::canonicalize(&subdir).expect("Failed to canonicalize subdir_abs");
-        assert_eq!(client.current_local_path, expected_path);
-    }
-
-    #[test]
-    fn test_lcd_to_parent_dir() {
-        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
-        let subdir = base_temp_dir.path().join("subdir_for_parent_test");
-        fs::create_dir(&subdir).expect("Failed to create subdir_for_parent_test");
-
-        let mut client = create_test_client(subdir.clone()); // Start in subdir
-
-        let result = client.lcd("..");
-        assert!(result.is_ok(), "lcd to parent failed: {:?}", result.err());
-
-        let expected_path = fs::canonicalize(base_temp_dir.path()).expect("Failed to canonicalize base_temp_dir");
-        assert_eq!(client.current_local_path, expected_path);
-    }
-
-    #[test]
-    fn test_lcd_non_existent_path() {
-        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
-        let initial_path = base_temp_dir.path().to_path_buf();
-        let mut client = create_test_client(initial_path.clone());
-
-        let result = client.lcd("non_existent_dir");
-        assert!(result.is_err(), "lcd to non_existent_dir should fail");
-        assert_eq!(client.current_local_path, initial_path); // Path should not change
-    }
-
-    #[test]
-    fn test_lcd_to_file() {
-        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
-        let file_path = base_temp_dir.path().join("file.txt");
-        fs::File::create(&file_path).expect("Failed to create file.txt");
-
-        let initial_path = base_temp_dir.path().to_path_buf();
-        let mut client = create_test_client(initial_path.clone());
-
-        let result = client.lcd("file.txt");
-        assert!(result.is_err(), "lcd to a file should fail");
-        let err_msg = result.err().unwrap().to_string();
-        assert!(err_msg.contains("Not a directory"), "Error message mismatch: {}", err_msg);
-        assert_eq!(client.current_local_path, initial_path); // Path should not change
-    }
-
-    #[test]
-    fn test_lcd_empty_path() {
-        let base_temp_dir = tempdir().expect("Failed to create base temp dir");
-        let initial_path = base_temp_dir.path().to_path_buf();
-        let mut client = create_test_client(initial_path.clone());
-
-        let result = client.lcd(""); // Behavior might depend on std::fs::canonicalize("")
-                                      // Typically canonicalize("") fails or refers to current dir.
-                                      // Our lcd should probably error if path is empty before canonicalize.
-                                      // Based on current lcd impl, canonicalize will fail.
-        assert!(result.is_err(), "lcd with empty path should fail");
-        assert_eq!(client.current_local_path, initial_path); // Path should not change
+            current_remote_path,
+            PathBuf::from("."), // Default local path for completer tests
+            "mockhost".to_string()
+        );
+        let client_rc = Rc::new(RefCell::new(sftp_client));
+        let completer = SftpCompleter::new(client_rc.clone());
+        (completer, client_rc)
     }
 
 
-    // --- lls Tests ---
-    #[test]
-    fn test_lls_current_dir_with_content() {
-        let temp_dir = tempdir().expect("Failed to create temp_dir for lls");
-        fs::File::create(temp_dir.path().join("file_a.txt")).unwrap();
-        fs::File::create(temp_dir.path().join("file_b.txt")).unwrap();
-        fs::create_dir(temp_dir.path().join("sub_dir_c")).unwrap();
+    fn assert_completions(
+        completer: &SftpCompleter,
+        line: &str,
+        pos: usize,
+        expected_start: usize,
+        expected_candidates: &[&str],
+    ) {
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        let (start, candidates) = completer.complete(line, pos, &ctx).unwrap();
+        assert_eq!(start, expected_start, "Completion start position mismatch for line: '{}', pos: {}", line, pos);
 
-        let client = create_test_client(temp_dir.path().to_path_buf());
-        // As per subtask, if output capture is hard, just test Ok/Err
-        // This test assumes lls prints to stdout. We check if it runs without error.
-        let result = client.lls(None);
-        assert!(result.is_ok(), "lls failed for current directory: {:?}", result.err());
+        let mut sorted_candidates: Vec<String> = candidates.into_iter().collect();
+        sorted_candidates.sort();
+        let mut sorted_expected: Vec<String> = expected_candidates.iter().map(|s| s.to_string()).collect();
+        sorted_expected.sort();
+
+        assert_eq!(sorted_candidates, sorted_expected, "Candidate list mismatch for line: '{}', pos: {}", line, pos);
     }
 
     #[test]
-    fn test_lls_relative_path_subdir() {
-        let base_dir = tempdir().expect("Failed to create base_dir for lls relative");
-        let sub_dir = base_dir.path().join("my_subdir");
-        fs::create_dir(&sub_dir).unwrap();
-        fs::File::create(sub_dir.join("file_in_sub.txt")).unwrap();
-
-        let client = create_test_client(base_dir.path().to_path_buf());
-        let result = client.lls(Some("my_subdir"));
-        assert!(result.is_ok(), "lls failed for relative subdir: {:?}", result.err());
+    fn complete_command_empty_input() {
+        let mock = MockSftpOps::new(); // No SFTP calls expected
+        let (completer, _client) = create_completer(mock, "/");
+        // Let's list them explicitly as per SftpCompleter::new
+        let expected = ["ls", "dir", "get", "put", "cd", "pwd", "rm", "mkdir", "rmdir", "help", "?", "exit", "quit", "bye"];
+        assert_completions(&completer, "", 0, 0, &expected);
     }
 
     #[test]
-    fn test_lls_absolute_path_subdir() {
-        let base_dir = tempdir().expect("Failed to create base_dir for lls absolute");
-        let sub_dir = base_dir.path().join("another_subdir");
-        fs::create_dir(&sub_dir).unwrap();
-        fs::File::create(sub_dir.join("abs_file.txt")).unwrap();
-        let sub_dir_abs_path_str = sub_dir.to_str().unwrap();
-
-        // Start client in a different directory
-        let other_dir = tempdir().expect("Failed to create other_dir for lls absolute");
-        let client = create_test_client(other_dir.path().to_path_buf());
-
-        let result = client.lls(Some(sub_dir_abs_path_str));
-        assert!(result.is_ok(), "lls failed for absolute subdir path: {:?}", result.err());
+    fn complete_command_partial() {
+        let mock = MockSftpOps::new();
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "l", 1, 0, &["ls"]);
+        assert_completions(&completer, "ge", 2, 0, &["get"]);
+         assert_completions(&completer, "ex", 2, 0, &["exit"]);
     }
 
     #[test]
-    fn test_lls_empty_directory() {
-        let temp_dir = tempdir().expect("Failed to create empty_dir for lls");
-        let client = create_test_client(temp_dir.path().to_path_buf());
-        let result = client.lls(None);
-        assert!(result.is_ok(), "lls failed for empty directory: {:?}", result.err());
-        // If we could capture output, we'd check for "(empty directory)"
+    fn complete_command_full_match_with_space() {
+        let mock = MockSftpOps::new();
+        let (completer, _client) = create_completer(mock, "/");
+        // If "ls" is typed, it should suggest "ls " to allow starting path completion.
+        assert_completions(&completer, "ls", 2, 0, &["ls "]);
+        assert_completions(&completer, "cd", 2, 0, &["cd "]);
+        // If space is already there
+        assert_completions(&completer, "ls ", 3, 3, &[]); // No command completion, should be path completion
     }
 
     #[test]
-    fn test_lls_non_existent_path() {
-        let temp_dir = tempdir().expect("Failed to create temp_dir for lls non-existent");
-        let client = create_test_client(temp_dir.path().to_path_buf());
-        let result = client.lls(Some("no_such_dir_here"));
-        assert!(result.is_err(), "lls should fail for non-existent path");
+    fn complete_path_ls_partial() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat() // stat for /
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("partial_match_file"), file_stat()),
+                (PathBuf::from("partial_other_dir"), dir_stat()),
+                (PathBuf::from("another_file"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "ls partial_", 11, 3, &[
+            "partial_match_file",
+            "partial_other_dir/"
+        ]);
     }
 
     #[test]
-    fn test_lls_on_file_path() {
-        let temp_dir = tempdir().expect("Failed to create temp_dir for lls on file");
-        let file_path = temp_dir.path().join("i_am_a_file.txt");
-        fs::File::create(&file_path).unwrap();
+    fn complete_path_cd_full_dir_name() {
+        let mut mock = MockSftpOps::new();
+         mock.expect_stat() // stat for /
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("existing_dir"), dir_stat()),
+                (PathBuf::from("other_file"), file_stat()),
+            ]));
 
-        let client = create_test_client(temp_dir.path().to_path_buf());
-        let result = client.lls(Some("i_am_a_file.txt"));
-        assert!(result.is_err(), "lls should fail when path is a file");
-         let err_msg = result.err().unwrap().to_string();
-        // The error comes from std::fs::read_dir, which varies by OS,
-        // but it should indicate it's not a directory or similar.
-        // For example, on Linux: "Not a directory (os error 20)"
-        // On Windows: "The directory name is invalid. (os error 267)"
-        // For now, checking it's an error is sufficient given the constraints.
-        assert!(err_msg.contains("Could not read directory"), "Error message mismatch: {}", err_msg);
+        let (completer, _client) = create_completer(mock, "/");
+        // When "cd existing_dir" is typed, and it's a unique match for a dir,
+        // rustyline might call complete again AFTER inserting "existing_dir/".
+        // Here, we test the state "cd existing_dir" (pos at end of existing_dir)
+        // It should offer "existing_dir/" if "existing_dir" is a known entry.
+        assert_completions(&completer, "cd existing_dir", 15, 3, &["existing_dir/"]);
+    }
+
+    #[test]
+    fn complete_path_get_with_spaces() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat() // stat for /
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("file with spaces.txt"), file_stat()),
+                (PathBuf::from("another file"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "get file with spa", 18, 4, &["file with spaces.txt"]);
+    }
+
+    #[test]
+    fn complete_path_cursor_not_at_end() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat())); // Allow any stat for simplicity
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("file_alpha"), file_stat()),
+                (PathBuf::from("file_beta"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        // Line: "ls file_alp remote_stuff_after"
+        // Pos: cursor after "file_alp" (position 12)
+        assert_completions(&completer, "ls file_alp remote_stuff_after", 12, 3, &["file_alpha"]);
+    }
+
+    #[test]
+    fn complete_path_empty_remote_dir() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(Vec::new())); // Empty directory
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "ls ", 3, 3, &[]);
+    }
+
+    #[test]
+    fn complete_path_readdir_fails() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Err(SshError::new(ErrorCode::SFTP(4), "Permission denied")));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "ls ", 3, 3, &[]);
+    }
+
+    #[test]
+    fn complete_path_absolute_path() {
+        let mut mock = MockSftpOps::new();
+        // Stat for the base path being listed
+        mock.expect_stat()
+            .with(eq(Path::new("/usr/"))) // Base dir derived from "/usr/lo"
+            .returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/usr/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("local"), dir_stat()),
+                (PathBuf::from("lib"), dir_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/home/user"); // Current dir doesn't matter for absolute
+        assert_completions(&completer, "ls /usr/lo", 11, 3, &["local/"]);
+    }
+
+    #[test]
+    fn complete_path_with_dot_dot() {
+        let mut mock = MockSftpOps::new();
+        // Stat for the resolved path "../d" from "/a/b/c" -> "/a/b/d"
+        let base_dir = PathBuf::from("/a/b"); // client.resolve_remote_path("../") from /a/b/c
+        mock.expect_stat()
+             .with(eq(base_dir.clone())) // for base_dir_to_list
+             .returning(move |_| Ok(dir_stat()));
+
+        mock.expect_readdir()
+            .with(eq(base_dir.clone())) // for readdir itself
+            .returning(|_| Ok(vec![
+                (PathBuf::from("dir1"), dir_stat()),
+                (PathBuf::from("dir2_other"), dir_stat()),
+                (PathBuf::from("file_in_b"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/a/b/c");
+        assert_completions(&completer, "ls ../dir", 10, 3, &["dir1/", "dir2_other/"]);
+    }
+
+    #[test]
+    fn complete_put_command_second_arg() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat())); // For current dir "/"
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("remote_place"), dir_stat()),
+                (PathBuf::from("remote_file.txt"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "put localfile.txt remote_", 25, 18, &[
+            "remote_place/",
+            "remote_file.txt"
+        ]);
+    }
+
+    #[test]
+    fn complete_put_command_after_first_arg_space() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("remote_A"), dir_stat()),
+                (PathBuf::from("remote_B"), file_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        // Cursor is at "put localfile.txt |" (pos 18)
+        assert_completions(&completer, "put localfile.txt ", 18, 18, &[
+            "remote_A/",
+            "remote_B"
+        ]);
+    }
+
+    #[test]
+    fn no_remote_completion_for_put_first_arg() {
+        let mock = MockSftpOps::new(); // No SFTP calls should be made
+        // Expectations for readdir or stat would fail if called.
+
+        let (completer, _client) = create_completer(mock, "/");
+        // Trying to complete first arg of put "put loca|"
+        assert_completions(&completer, "put loca", 8, 4, &[]); // No remote completions
+    }
+
+    #[test]
+    fn complete_path_multiple_spaces_between_args() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![(PathBuf::from("spaced_out_file"), file_stat())]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "ls    spaced_out", 17, 6, &["spaced_out_file"]);
+    }
+
+    #[test]
+    fn complete_path_leading_spaces_before_command() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![(PathBuf::from("lead_file"), file_stat())]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        assert_completions(&completer, "  ls lead_", 11, 5, &["lead_file"]);
+    }
+     #[test]
+    fn complete_path_trailing_spaces_after_partial_arg() {
+        let mut mock = MockSftpOps::new();
+        mock.expect_stat().returning(|_| Ok(dir_stat()));
+        mock.expect_readdir()
+            .with(eq(Path::new("/")))
+            .returning(|_| Ok(vec![
+                (PathBuf::from("trail_file"), file_stat()),
+                (PathBuf::from("trail_dir"), dir_stat()),
+            ]));
+
+        let (completer, _client) = create_completer(mock, "/");
+        // This case means "ls trail |" (cursor after space)
+        // The `determine_completion_context` should identify this as completing a *new, empty* argument.
+        // However, if the intent is to complete "trail" itself, the cursor should be `ls trail|`
+        // If line is "ls trail  " and pos is 10 (after spaces), it means we are starting a new (3rd) argument.
+        // The current completer logic, if `determine_completion_context` sets `text=""` and `start_pos=pos`,
+        // would try to list entries in "/" matching an empty prefix.
+        assert_completions(&completer, "ls trail  ", 10, 10, &[
+            "trail_file",
+            "trail_dir/"
+        ]);
     }
 }

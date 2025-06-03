@@ -6,7 +6,6 @@ To run.. same thing.
 
 # TODO
 
-Tell Gemini the autocomplete is stupid and to fix it.
 Maybe add lcd and lls or something?
 Add a funny backdoor.
 Get dinner.

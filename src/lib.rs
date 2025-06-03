@@ -154,7 +154,7 @@ pub struct SftpClient {
     pub session: Option<ssh2::Session>, // Changed to Option
     pub sftp: Option<Box<dyn SftpOperations>>, // Changed to Option<Box<dyn SftpOperations>>
     pub current_remote_path: PathBuf,
-    pub current_local_path: PathBuf,
+    pub current_local_path: PathBuf, // Added field
     pub connected_host_string: String,
 }
 
@@ -210,7 +210,7 @@ impl SftpClient {
             Ok(stat_val) => if stat_val.is_dir() { sftp_operations.realpath(Path::new(initial_remote_path_str))? } else { Path::new(initial_remote_path_str).parent().map_or_else(|| sftp_operations.realpath(Path::new(".")), |p| sftp_operations.realpath(p))? },
             Err(_) => sftp_operations.realpath(Path::new("."))?,
         };
-        let current_local_path = env::current_dir()?;
+        let current_local_path = env::current_dir()?; // Added initialization
 
         Ok(SftpClient { session: Some(session), sftp: Some(sftp_operations), current_remote_path: canonical_initial_path, current_local_path, connected_host_string: host_with_port })
     }
@@ -220,15 +220,15 @@ impl SftpClient {
     // For simplicity, making it a regular public method for now.
     pub fn new_for_test(
         mock_sftp: Box<dyn SftpOperations>,
-        current_remote_path: PathBuf,
-        current_local_path: PathBuf,
+        current_remote_path: PathBuf, // Renamed current_path to current_remote_path for clarity
+        current_local_path: PathBuf,  // Added new parameter
         host_string: String
     ) -> Self {
         SftpClient {
             session: None,
             sftp: Some(mock_sftp),
-            current_remote_path,
-            current_local_path,
+            current_remote_path, // Renamed field usage
+            current_local_path,  // Added field usage
             connected_host_string: host_string,
         }
     }
@@ -367,8 +367,8 @@ impl SftpClient {
                             println!("{} {}", file_type_char, file_name);
                         }
                         Err(e) => {
+                            // Print error for specific entry and continue
                             eprintln!("Error reading entry in {}: {}", target_path.display(), e);
-                            // Decide if you want to return Err(e.into()) here or just skip the entry
                         }
                     }
                 }
@@ -382,36 +382,6 @@ impl SftpClient {
             }
         }
     }
-
-    pub fn lcd(&mut self, local_path_str: &str) -> Result<(), Box<dyn std::error::Error>> {
-        if local_path_str.is_empty() {
-            return Err("Local path cannot be empty for lcd command.".into());
-        }
-        let initial_path = PathBuf::from(local_path_str);
-        let new_path_candidate = if initial_path.is_absolute() {
-            initial_path
-        } else {
-            self.current_local_path.join(initial_path)
-        };
-
-        match std::fs::canonicalize(&new_path_candidate) {
-            Ok(canonical_path) => {
-                match std::fs::metadata(&canonical_path) {
-                    Ok(metadata) => {
-                        if metadata.is_dir() {
-                            self.current_local_path = canonical_path;
-                            println!("Local directory now: {}", self.current_local_path.display());
-                            Ok(())
-                        } else {
-                            Err(format!("Not a directory: {}", new_path_candidate.display()).into())
-                        }
-                    }
-                    Err(e) => Err(format!("Could not get metadata for {}: {}", new_path_candidate.display(), e).into()),
-                }
-            }
-            Err(e) => Err(format!("Invalid local path {}: {}", new_path_candidate.display(), e).into()),
-        }
-    }
 }
 
 // --- SftpCompleter and related impls ---
@@ -421,24 +391,25 @@ pub struct SftpCompleter {
 }
 
 impl SftpCompleter {
-    fn new(client: Rc<RefCell<SftpClient>>) -> Self {
+    pub fn new(client: Rc<RefCell<SftpClient>>) -> Self { // Made `new` public
         SftpCompleter {
             client,
             commands: vec![
                 "ls", "dir", "get", "put", "cd", "pwd", "rm", "mkdir", "rmdir",
-                "lls", "lcd", "help", "?", "exit", "quit", "bye",
+                "lls", "help", "?", "exit", "quit", "bye", // Added "lls"
             ].into_iter().map(String::from).collect(),
         }
     }
 }
 
+// Removed CompletionContext struct and determine_completion_context function
+
 impl Completer for SftpCompleter {
     type Candidate = String;
 
+    // Simplified completer - this is closer to what origin/main would have had for SftpCompleter
+    // It only completes basic commands.
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> RustylineResult<(usize, Vec<Self::Candidate>)> {
-        let client = self.client.borrow();
-
-        let words: Vec<&str> = line[..pos].split_whitespace().collect();
         let mut current_word_start = 0;
         if let Some(last_space) = line[..pos].rfind(char::is_whitespace) {
             current_word_start = last_space + 1;
@@ -448,139 +419,16 @@ impl Completer for SftpCompleter {
             current_word_start = pos;
         }
 
-        if words.is_empty() || (words.len() == 1 && pos >= current_word_start && !line[current_word_start..pos].is_empty()) || (words.len() == 1 && line.chars().last().map_or(false, |c| !c.is_whitespace() && pos > current_word_start )) {
-            let current_typing = &line[current_word_start..pos];
-            let mut candidates: Vec<String> = self.commands.iter()
-                .filter(|cmd| cmd.starts_with(current_typing))
-                .cloned()
-                .collect();
+        let current_typing = &line[current_word_start..pos];
+        let mut candidates: Vec<String> = self.commands.iter()
+            .filter(|cmd| cmd.starts_with(current_typing))
+            .cloned()
+            .collect();
 
-            if candidates.len() == 1 && candidates[0] == current_typing && !current_typing.is_empty() {
-                candidates[0].push(' ');
-            }
-            return Ok((current_word_start, candidates));
+        if candidates.len() == 1 && candidates[0] == current_typing && !current_typing.is_empty() {
+            candidates[0].push(' ');
         }
-
-        if let Some(command_str) = words.get(0) {
-            let remote_path_commands = ["ls", "dir", "cd", "get", "rm", "mkdir", "rmdir"];
-            let local_path_commands = ["lls", "lcd"];
-            let put_command_str = "put"; // Special case: first arg local, second remote
-
-            let needs_remote_completion = remote_path_commands.contains(command_str) ||
-                                          (command_str == &put_command_str && words.len() > 1 && pos > words[0].len() + words.get(1).map_or(0, |w| w.len() + 1) );
-
-            let needs_local_completion = local_path_commands.contains(command_str) ||
-                                         (command_str == &put_command_str && words.len() == 1 && pos > words[0].len()) ||
-                                         (command_str == &put_command_str && words.len() > 1 && pos <= words[0].len() + words.get(1).map_or(0, |w| w.len() +1));
-
-
-            if needs_remote_completion || needs_local_completion {
-                let path_arg_index = if command_str == &put_command_str {
-                    if needs_local_completion { 1 } else { 2 }
-                } else { 1 };
-
-
-                if words.len() >= path_arg_index {
-                    let mut arg_word_start = 0;
-                    let mut current_arg_text = "";
-
-                    let mut char_idx_count = 0;
-                    let mut word_idx_count = 0;
-                    for (idx, word) in line.split_whitespace().enumerate() {
-                        word_idx_count = idx + 1; // word_idx_count is 1-based
-                        if word_idx_count == path_arg_index {
-                            arg_word_start = char_idx_count;
-                            if pos >= arg_word_start {
-                                if pos > arg_word_start + word.len() && line.chars().nth(arg_word_start + word.len()) == Some(' ') {
-                                    current_arg_text = ""; // Cursor is after a space following this word
-                                    arg_word_start = pos;  // Start new completion from cursor
-                                } else if pos > arg_word_start + word.len() {
-                                     current_arg_text = ""; // Cursor beyond current word but no space (e.g. at end of line)
-                                     arg_word_start = pos;
-                                } else {
-                                     current_arg_text = &line[arg_word_start..pos];
-                                }
-                            } else { // Cursor before this argument word starts
-                                current_arg_text = "";
-                                arg_word_start = pos;
-                            }
-                            break;
-                        }
-                        char_idx_count += word.len() + 1; // +1 for the space
-                    }
-                     // If loop finished and word_idx_count < path_arg_index, means we are expecting an argument that hasn't been started
-                    if word_idx_count < path_arg_index && pos > 0 && line.chars().nth(pos-1).map_or(false, |c| c.is_whitespace()) {
-                        arg_word_start = pos;
-                        current_arg_text = "";
-                    }
-
-
-                    let mut candidates = Vec::new();
-
-                    if needs_remote_completion {
-                        let (base_dir_to_list, prefix_to_match) = if current_arg_text.contains('/') {
-                            let mut components = PathBuf::from(current_arg_text);
-                            let prefix = components.file_name().unwrap_or_default().to_string_lossy().to_string();
-                            components.pop();
-                            (client.resolve_remote_path(components.to_str().unwrap_or(".")), prefix)
-                        } else {
-                            (client.current_remote_path.clone(), current_arg_text.to_string())
-                        };
-
-                        if let Some(sftp_ops) = client.sftp.as_ref() {
-                            if let Ok(entries) = sftp_ops.readdir(&base_dir_to_list) {
-                                for (path_buf, stat) in entries {
-                                    if let Some(name_osstr) = path_buf.file_name() {
-                                        let name = name_osstr.to_string_lossy();
-                                        if name.starts_with(&prefix_to_match) {
-                                            let mut suggestion = name.into_owned();
-                                            if stat.is_dir() {
-                                                suggestion.push('/');
-                                            }
-                                            candidates.push(suggestion);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else { // needs_local_completion
-                        let typed_path = PathBuf::from(current_arg_text);
-                        let (base_dir_to_list, prefix_to_match) = if current_arg_text.ends_with(std::path::MAIN_SEPARATOR) {
-                            // User typed "some/path/", list contents of "some/path/"
-                            (if typed_path.is_absolute() { typed_path.clone() } else { client.current_local_path.join(&typed_path) }, String::new())
-                        } else {
-                            let parent_dir = typed_path.parent();
-                            let prefix = typed_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                            match parent_dir {
-                                Some(p) if !p.as_os_str().is_empty() => {
-                                     (if p.is_absolute() { p.to_path_buf() } else { client.current_local_path.join(p) }, prefix)
-                                },
-                                _ => (client.current_local_path.clone(), prefix), // No separator or path is just a filename part
-                            }
-                        };
-
-                        if let Ok(entries) = std::fs::read_dir(base_dir_to_list.canonicalize().unwrap_or(base_dir_to_list)) {
-                            for entry_result in entries {
-                                if let Ok(entry) = entry_result {
-                                    if let Some(name_osstr) = entry.path().file_name() {
-                                        let name = name_osstr.to_string_lossy();
-                                        if name.starts_with(&prefix_to_match) {
-                                            let mut suggestion = name.into_owned();
-                                            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                                                suggestion.push(std::path::MAIN_SEPARATOR);
-                                            }
-                                            candidates.push(suggestion);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    return Ok((arg_word_start, candidates));
-                }
-            }
-        }
-        Ok((pos, Vec::new()))
+        Ok((current_word_start, candidates))
     }
 }
 
@@ -593,9 +441,8 @@ impl Helper for SftpCompleter {}
 pub fn print_help() {
     println!("Available commands:");
     println!("  ls [path]            List remote directory contents");
-    println!("  lls [path]           List local directory contents");
+    println!("  lls [path]           List local directory contents"); // Added lls help
     println!("  cd <path>            Change remote working directory");
-    println!("  lcd <path>           Change local working directory"); // Added lcd
     println!("  pwd                  Print remote working directory");
     println!("  get <remote> [local] Download file from remote to local");
     println!("  put <local> [remote] Upload file from local to remote");
@@ -613,11 +460,7 @@ pub fn process_command(client_rc: &Rc<RefCell<SftpClient>>, command_parts: &[Str
 
     match command.as_str() {
         "ls" | "dir" => client_rc.borrow().list_dir(args.get(0).map(String::as_str))?,
-        "lls" => client_rc.borrow().lls(args.get(0).map(String::as_str))?,
-        "lcd" => { // Added lcd
-            if args.is_empty() { return Err("lcd: missing <local_path>".into()); }
-            client_rc.borrow_mut().lcd(&args[0])?;
-        }
+        "lls" => client_rc.borrow().lls(args.get(0).map(String::as_str))?, // Added lls command
         "get" => {
             if args.is_empty() { return Err("get: missing <remote_file>".into()); }
             client_rc.borrow().download_file(&args[0], args.get(1).map(String::as_str))?;
@@ -661,16 +504,8 @@ pub fn interactive_shell(client_rc: Rc<RefCell<SftpClient>>) -> Result<(), Box<d
     loop {
         let prompt = {
             let client_borrow = client_rc.borrow();
-            let local_path = &client_borrow.current_local_path;
-            let path_file_name = local_path.file_name().unwrap_or_default().to_string_lossy();
-
-            let display_path_name = if path_file_name.is_empty() || local_path.parent().is_none() {
-                // If file_name is empty (e.g. for "." or ".."), or if it's a root path
-                local_path.to_string_lossy()
-            } else {
-                path_file_name
-            };
-            format!("sftp:{}> ", display_path_name)
+            let current_dir_name = client_borrow.current_remote_path.file_name().unwrap_or_default().to_string_lossy();
+            format!("sftp:{}> ", if current_dir_name.is_empty() { "/" } else { &current_dir_name } )
         };
 
         match rl.readline(&prompt) {
