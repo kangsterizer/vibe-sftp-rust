@@ -328,6 +328,112 @@ impl SftpClient {
         let sftp_ops = self.sftp.as_ref().ok_or_else(|| SshError::new(ssh2::ErrorCode::Session(-1), "SFTP not initialized"))?;
         sftp_ops.rmdir(&remote_path)?; println!("Removed remote directory: {}", remote_path.display()); Ok(())
     }
+
+    pub fn upload_directory(&self, local_dir_path_str: &str, remote_dest_str: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let local_base_path = PathBuf::from(local_dir_path_str);
+        if !local_base_path.exists() {
+            return Err(format!("Local directory not found: {}", local_base_path.display()).into());
+        }
+        if !local_base_path.is_dir() {
+            return Err(format!("Local path is not a directory: {}", local_base_path.display()).into());
+        }
+
+        let sftp_ops = self.sftp.as_ref().ok_or_else(|| SshError::new(ssh2::ErrorCode::Session(-1), "SFTP not initialized"))?;
+
+        // Determine the top-level remote directory name
+        let local_dir_name = local_base_path.file_name().ok_or("Could not get local directory name")?;
+
+        // Determine base remote path
+        let mut remote_base_upload_path = remote_dest_str
+            .map(|d| self.resolve_remote_path(d))
+            .unwrap_or_else(|| self.current_remote_path.clone());
+
+        // If remote_dest_str is specified and points to an existing directory, or if it's not specified (current_remote_path),
+        // then append the local directory's name.
+        // If remote_dest_str is specified and does NOT point to an existing directory, it's taken as the full path for the new directory.
+        match sftp_ops.stat(&remote_base_upload_path) {
+            Ok(stat) if stat.is_dir() => { // Target is an existing directory
+                remote_base_upload_path.push(local_dir_name);
+            }
+            Ok(_) => { // Target exists but is not a directory - this is an error for directory upload base
+                return Err(format!("Remote destination '{}' exists and is not a directory.", remote_base_upload_path.display()).into());
+            }
+            Err(_) => { // Target does not exist, use it as is (or if remote_dest_str was not given, this path is current_remote_path + local_dir_name)
+                if remote_dest_str.is_none() { // Not specified, so it was current_remote_path
+                     remote_base_upload_path.push(local_dir_name);
+                }
+                // If remote_dest_str was specified and doesn't exist, remote_base_upload_path is already correct.
+            }
+        }
+
+        println!("Uploading directory '{}' to '{}'", local_base_path.display(), remote_base_upload_path.display());
+
+        // Create the top-level directory on the remote
+        match sftp_ops.mkdir(&remote_base_upload_path, 0o755) {
+            Ok(_) => println!("Created remote directory: {}", remote_base_upload_path.display()),
+            Err(e) => {
+                // Check if error is because directory already exists, which might be fine
+                if let Ok(stat) = sftp_ops.stat(&remote_base_upload_path) {
+                    if !stat.is_dir() {
+                        return Err(format!("Failed to create remote directory '{}', path exists and is not a directory: {}", remote_base_upload_path.display(), e).into());
+                    }
+                    // If it exists and is a directory, we can proceed.
+                    println!("Remote directory {} already exists.", remote_base_upload_path.display());
+                } else {
+                    // Some other error during mkdir or stat
+                    return Err(format!("Failed to create or verify remote directory '{}': {}", remote_base_upload_path.display(), e).into());
+                }
+            }
+        }
+
+        self.upload_directory_recursive(&local_base_path, &remote_base_upload_path, sftp_ops)?;
+
+        Ok(())
+    }
+
+    // Helper recursive function
+    fn upload_directory_recursive(
+        &self,
+        local_current_path: &Path,
+        remote_current_path: &Path,
+        sftp_ops: &Box<dyn SftpOperations>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for entry_result in std::fs::read_dir(local_current_path)? {
+            let entry = entry_result?;
+            let local_entry_path = entry.path();
+            let file_name = entry.file_name();
+            let remote_entry_path = remote_current_path.join(&file_name);
+
+            if local_entry_path.is_dir() {
+                println!("Creating remote directory: {}", remote_entry_path.display());
+                match sftp_ops.mkdir(&remote_entry_path, 0o755) {
+                    Ok(_) => {},
+                    Err(e) => { // Check if error is because directory already exists
+                         if let Ok(stat) = sftp_ops.stat(&remote_entry_path) {
+                            if !stat.is_dir() {
+                                return Err(format!("Failed to create remote directory '{}', path exists and is not a directory: {}", remote_entry_path.display(), e).into());
+                            }
+                         } else {
+                            return Err(format!("Failed to create or verify remote directory '{}': {}", remote_entry_path.display(), e).into());
+                         }
+                    }
+                }
+                self.upload_directory_recursive(&local_entry_path, &remote_entry_path, sftp_ops)?;
+            } else if local_entry_path.is_file() {
+                println!("Uploading '{}' to '{}'", local_entry_path.display(), remote_entry_path.display());
+                let mut local_file = File::open(&local_entry_path)?;
+                let mut remote_file = sftp_ops.open_mode(
+                    &remote_entry_path,
+                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                    0o644,
+                    OpenType::File,
+                )?;
+                let bytes_copied = std::io::copy(&mut local_file, &mut remote_file)?;
+                println!("Uploaded {} bytes.", bytes_copied);
+            }
+        }
+        Ok(())
+    }
 }
 
 // --- SftpCompleter and related impls ---
@@ -341,7 +447,7 @@ impl SftpCompleter {
         SftpCompleter {
             client,
             commands: vec![
-                "ls", "dir", "get", "put", "cd", "pwd", "rm", "mkdir", "rmdir", "help", "?", "exit", "quit", "bye",
+                "ls", "dir", "get", "put", "putr", "cd", "pwd", "rm", "mkdir", "rmdir", "help", "?", "exit", "quit", "bye",
             ].into_iter().map(String::from).collect(),
         }
     }
@@ -515,6 +621,7 @@ pub fn print_help() {
     println!("  pwd                  Print remote working directory");
     println!("  get <remote> [local] Download file from remote to local");
     println!("  put <local> [remote] Upload file from local to remote");
+    println!("  putr <local_dir> [remote_dest] Upload directory recursively");
     println!("  rm <remote_file>     Remove remote file");
     println!("  mkdir <remote_dir>   Create remote directory");
     println!("  rmdir <remote_dir>   Remove remote directory (must be empty)");
@@ -536,6 +643,10 @@ pub fn process_command(client_rc: &Rc<RefCell<SftpClient>>, command_parts: &[Str
         "put" => {
             if args.is_empty() { return Err("put: missing <local_file>".into()); }
             client_rc.borrow().upload_file(&args[0], args.get(1).map(String::as_str))?;
+        }
+        "putr" => {
+            if args.is_empty() { return Err("putr: missing <local_directory>".into()); }
+            client_rc.borrow().upload_directory(&args[0], args.get(1).map(String::as_str))?;
         }
         "cd" => {
             if args.is_empty() { return Err("cd: missing <remote_path>".into()); }

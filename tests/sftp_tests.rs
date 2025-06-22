@@ -408,6 +408,285 @@ mod sftp_client_unit_tests {
         assert!(client.cd_remote(target_file_str).is_err());
         assert_eq!(client.current_remote_path, initial_dir); // Path should not change
     }
+
+    // --- Tests for upload_directory ---
+    // Helper to create a basic FileStat for a directory
+    fn mock_dir_stat() -> FileStat {
+        FileStat { perm: Some(0o40755), ..Default::default() } // is_dir() will be true
+    }
+    // Helper to create a basic FileStat for a file
+    fn mock_file_stat() -> FileStat {
+        FileStat { perm: Some(0o100644), ..Default::default() } // is_file() will be true
+    }
+
+
+    #[test]
+    fn test_upload_directory_local_path_not_found() {
+        let mock_sftp = MockSftpOps::new(); // No SFTP calls expected
+        let client = SftpClient::new_for_test(Box::new(mock_sftp), PathBuf::from("/remote"), "mockhost".to_string());
+        let result = client.upload_directory("/non/existent/local_dir", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Local directory not found"));
+    }
+
+    #[test]
+    fn test_upload_directory_local_path_is_file() {
+        let mock_sftp = MockSftpOps::new(); // No SFTP calls expected
+        let client = SftpClient::new_for_test(Box::new(mock_sftp), PathBuf::from("/remote"), "mockhost".to_string());
+
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let result = client.upload_directory(temp_file.path().to_str().unwrap(), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Local path is not a directory"));
+    }
+
+    #[test]
+    fn test_upload_empty_directory_to_current_remote() {
+        let mut mock_sftp = MockSftpOps::new();
+        let current_remote_dir = PathBuf::from("/remote/current");
+        let local_temp_dir = tempdir().unwrap();
+        let local_dir_name = local_temp_dir.path().file_name().unwrap().to_str().unwrap();
+
+        let expected_remote_target_dir = current_remote_dir.join(local_dir_name);
+
+        // Mock for initial stat of remote_base_upload_path (current_remote_dir in this case)
+        mock_sftp.expect_stat()
+            .with(eq(current_remote_dir.clone()))
+            .times(1)
+            .returning(|_| Ok(mock_dir_stat())); // Assume current remote dir exists
+
+        // Mock for mkdir of the new top-level directory
+        mock_sftp.expect_mkdir()
+            .with(eq(expected_remote_target_dir.clone()), eq(0o755))
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let client = SftpClient::new_for_test(
+            Box::new(mock_sftp),
+            current_remote_dir.clone(),
+            "mockhost".to_string()
+        );
+
+        let result = client.upload_directory(local_temp_dir.path().to_str().unwrap(), None);
+        assert!(result.is_ok(), "upload_directory failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_upload_directory_with_one_file_to_specific_remote_dir() {
+        let mut mock_sftp = MockSftpOps::new();
+        let current_remote_whatever = PathBuf::from("/remote/foo"); // current remote dir of client, less important here
+        let specified_remote_dest = PathBuf::from("/upload/target");
+
+        let local_temp_dir = tempdir().unwrap();
+        let local_dir_path = local_temp_dir.path();
+        let local_dir_name = local_dir_path.file_name().unwrap().to_str().unwrap();
+
+        // Create a file in the local temp directory
+        let file_path = local_dir_path.join("file1.txt");
+        let mut file = File::create(&file_path).unwrap();
+        writeln!(file, "Hello, world!").unwrap();
+
+        let expected_remote_base_dir = specified_remote_dest.join(local_dir_name);
+        let expected_remote_file_path = expected_remote_base_dir.join("file1.txt");
+
+        // 1. Stat for the specified_remote_dest
+        mock_sftp.expect_stat()
+            .with(eq(specified_remote_dest.clone()))
+            .times(1)
+            .returning(|_| Ok(mock_dir_stat())); // Assume /upload/target exists and is a dir
+
+        // 2. Mkdir for the main directory (e.g., /upload/target/local_dir_name)
+        mock_sftp.expect_mkdir()
+            .with(eq(expected_remote_base_dir.clone()), eq(0o755))
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        // 3. Open_mode for the file
+        let mut mock_ssh_file = MockSshFile::new();
+        mock_ssh_file.expect_write().returning(|buf| Ok(buf.len())); // Mock write
+        mock_ssh_file.expect_flush().returning(|| Ok(())); // Mock flush
+
+        mock_sftp.expect_open_mode()
+            .with(
+                eq(expected_remote_file_path.clone()),
+                eq(OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE),
+                eq(0o644),
+                eq(OpenType::File)
+            )
+            .times(1)
+            .returning(move |_, _, _, _| Ok(Box::new(mock_ssh_file))); // Return the mock ssh file
+
+        let client = SftpClient::new_for_test(
+            Box::new(mock_sftp),
+            current_remote_whatever,
+            "mockhost".to_string()
+        );
+
+        let result = client.upload_directory(local_dir_path.to_str().unwrap(), Some(specified_remote_dest.to_str().unwrap()));
+        assert!(result.is_ok(), "upload_directory failed: {:?}", result.err());
+    }
+
+
+    #[test]
+    fn test_upload_directory_with_nesting_to_non_existent_remote_target() {
+        let mut mock_sftp = MockSftpOps::new();
+        let client_current_remote = PathBuf::from("/irrelevant");
+        let specified_remote_dest_full_path = PathBuf::from("/new_uploads/my_project"); // This is the full path for the new dir
+
+        let local_temp_dir = tempdir().unwrap();
+        let local_dir_path = local_temp_dir.path(); // This is "my_project_local_name" effectively
+
+        // Create local structure:
+        // my_project_local_name/
+        //   file_top.txt
+        //   sub_dir/
+        //     file_nested.txt
+        let file_top_path = local_dir_path.join("file_top.txt");
+        File::create(&file_top_path).unwrap().write_all(b"top content").unwrap();
+
+        let sub_dir_path = local_dir_path.join("sub_dir");
+        fs::create_dir(&sub_dir_path).unwrap();
+        let file_nested_path = sub_dir_path.join("file_nested.txt");
+        File::create(&file_nested_path).unwrap().write_all(b"nested content").unwrap();
+
+        // Expected remote paths based on specified_remote_dest_full_path being the actual target name
+        let remote_base_dir_path = specified_remote_dest_full_path.clone(); // e.g. /new_uploads/my_project
+        let remote_file_top_path = remote_base_dir_path.join("file_top.txt");
+        let remote_sub_dir_path = remote_base_dir_path.join("sub_dir");
+        let remote_file_nested_path = remote_sub_dir_path.join("file_nested.txt");
+
+        // --- Mock expectations ---
+        // 1. Initial stat for specified_remote_dest_full_path (e.g. /new_uploads/my_project)
+        mock_sftp.expect_stat()
+            .with(eq(specified_remote_dest_full_path.clone()))
+            .times(1)
+            .returning(|_| Err(SshError::new(ErrorCode::NoSuchFile, "path does not exist"))); // Target remote path does not exist
+
+        // 2. Mkdir for the base directory (e.g. /new_uploads/my_project)
+        mock_sftp.expect_mkdir()
+            .with(eq(remote_base_dir_path.clone()), eq(0o755))
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        // 3. Open_mode for file_top.txt
+        let mut mock_ssh_file_top = MockSshFile::new();
+        mock_ssh_file_top.expect_write().returning(|b| Ok(b.len()));
+        mock_ssh_file_top.expect_flush().returning(|| Ok(()));
+        mock_sftp.expect_open_mode()
+            .with(eq(remote_file_top_path), any(), any(), any())
+            .times(1)
+            .return_once(move |_,_,_,_| Ok(Box::new(mock_ssh_file_top)));
+
+        // 4. Mkdir for sub_dir
+        mock_sftp.expect_mkdir()
+            .with(eq(remote_sub_dir_path.clone()), eq(0o755))
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        // 5. Open_mode for file_nested.txt
+        let mut mock_ssh_file_nested = MockSshFile::new();
+        mock_ssh_file_nested.expect_write().returning(|b| Ok(b.len()));
+        mock_ssh_file_nested.expect_flush().returning(|| Ok(()));
+        mock_sftp.expect_open_mode()
+            .with(eq(remote_file_nested_path), any(), any(), any())
+            .times(1)
+            .return_once(move |_,_,_,_| Ok(Box::new(mock_ssh_file_nested)));
+
+        let client = SftpClient::new_for_test(
+            Box::new(mock_sftp),
+            client_current_remote,
+            "mockhost".to_string()
+        );
+
+        let result = client.upload_directory(local_dir_path.to_str().unwrap(), Some(specified_remote_dest_full_path.to_str().unwrap()));
+        assert!(result.is_ok(), "upload_directory failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_upload_directory_remote_target_is_file_error() {
+        let mut mock_sftp = MockSftpOps::new();
+        let client_current_remote = PathBuf::from("/anywhere");
+        let specified_remote_dest = PathBuf::from("/remote_file.txt"); // This path points to a file
+
+        let local_temp_dir = tempdir().unwrap();
+        let local_dir_path = local_temp_dir.path();
+
+        // Mock for initial stat of specified_remote_dest
+        mock_sftp.expect_stat()
+            .with(eq(specified_remote_dest.clone()))
+            .times(1)
+            .returning(|_| Ok(mock_file_stat())); // Remote target exists AND IS A FILE
+
+        // mkdir for the base directory should NOT be called.
+        mock_sftp.expect_mkdir().times(0);
+
+        let client = SftpClient::new_for_test(
+            Box::new(mock_sftp),
+            client_current_remote,
+            "mockhost".to_string()
+        );
+
+        let result = client.upload_directory(local_dir_path.to_str().unwrap(), Some(specified_remote_dest.to_str().unwrap()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exists and is not a directory"));
+    }
+
+    #[test]
+    fn test_upload_directory_mkdir_fails_for_nested_dir() {
+        let mut mock_sftp = MockSftpOps::new();
+        let current_remote_dir = PathBuf::from("/remote");
+
+        let local_temp_dir = tempdir().unwrap();
+        let local_dir_path = local_temp_dir.path(); // e.g., "main_dir"
+        let local_dir_name = local_dir_path.file_name().unwrap().to_str().unwrap();
+
+        let sub_dir_path = local_dir_path.join("sub"); // "main_dir/sub"
+        fs::create_dir(&sub_dir_path).unwrap();
+        // No file needed in sub_dir for this test, just the dir itself.
+
+        let expected_remote_base_dir = current_remote_dir.join(local_dir_name); // "/remote/main_dir"
+        let expected_remote_sub_dir = expected_remote_base_dir.join("sub");    // "/remote/main_dir/sub"
+
+        // 1. Stat for current_remote_dir (base for upload if no specific remote dest)
+        mock_sftp.expect_stat()
+            .with(eq(current_remote_dir.clone()))
+            .times(1)
+            .returning(|_| Ok(mock_dir_stat()));
+
+        // 2. Mkdir for the main directory (e.g., /remote/main_dir) - this one succeeds
+        mock_sftp.expect_mkdir()
+            .with(eq(expected_remote_base_dir.clone()), eq(0o755))
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        // 3. Mkdir for the nested directory (e.g., /remote/main_dir/sub) - this one fails
+        mock_sftp.expect_mkdir()
+            .with(eq(expected_remote_sub_dir.clone()), eq(0o755))
+            .times(1)
+            .returning(|_, _| Err(SshError::new(ErrorCode::PermissionDenied, "cannot create nested")));
+
+        // 4. Stat for the nested directory (after mkdir fails, to check if it exists as non-dir)
+        // This is part of the error handling in upload_directory_recursive
+        mock_sftp.expect_stat()
+            .with(eq(expected_remote_sub_dir.clone()))
+            .times(1) // This will be called by the error handling path
+            .returning(|_| Err(SshError::new(ErrorCode::NoSuchFile, "confirm not a file")));
+
+
+        let client = SftpClient::new_for_test(
+            Box::new(mock_sftp),
+            current_remote_dir.clone(),
+            "mockhost".to_string()
+        );
+
+        let result = client.upload_directory(local_dir_path.to_str().unwrap(), None);
+        assert!(result.is_err(), "Expected upload_directory to fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to create or verify remote directory"), "Error message mismatch: {}", err_msg);
+        assert!(err_msg.contains(&format!("{}", expected_remote_sub_dir.display())), "Error message should contain path: {}", err_msg);
+        assert!(err_msg.contains("cannot create nested"), "Error message should contain original error: {}", err_msg);
+    }
+
 }
 
 #[cfg(test)]
@@ -419,6 +698,9 @@ mod sftp_completer_tests {
     use rustyline::history::DefaultHistory; // Import DefaultHistory
     use std::rc::Rc;
     use std::cell::RefCell;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use tempfile::tempdir; // For creating temporary directories for tests
 
     // Helper to create a FileStat for a directory
     fn dir_stat() -> FileStat {
@@ -429,6 +711,19 @@ mod sftp_completer_tests {
     fn file_stat() -> FileStat {
         FileStat { perm: Some(0o100644), size: Some(1024), uid: Some(1000), gid: Some(1000), atime: Some(0), mtime: Some(0) }
     }
+
+    // Mock ssh2::File for use in open_mode return
+    mock! {
+        pub SshFile {} // Struct name will be MockSshFile
+        impl Write for SshFile {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize>;
+            fn flush(&mut self) -> std::io::Result<()>;
+        }
+        // We also need to mock the Read trait if we were testing downloads,
+        // and the Drop trait if specific drop behavior is important.
+        // For upload_directory, primarily Write is needed for the remote file.
+    }
+
 
     // Simpler setup: creates client and completer, assumes mock expectations are set beforehand.
     fn create_completer(mock_sftp: MockSftpOps, current_remote_path_str: &str) -> (SftpCompleter, Rc<RefCell<SftpClient>>) {
